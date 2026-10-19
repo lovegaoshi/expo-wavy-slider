@@ -16,15 +16,16 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.interaction.Interaction
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.progressSemantics
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.*
@@ -537,15 +538,15 @@ fun WavySlider(
     }
 ) {
     val state = remember(valueRange) {
-        SliderState(value, 0, onValueChangeFinished, valueRange)
+        SliderState(value = value, steps = 0, trackRange = valueRange)
     }
-    state.onValueChangeFinished = onValueChangeFinished
-    state.onValueChange = onValueChange
     state.value = value
     WavySlider(
         state = state,
         modifier = modifier,
         enabled = enabled,
+        onValueChange = onValueChange,
+        onValueChangeFinished = onValueChangeFinished,
         interactionSource = interactionSource,
         thumb = thumb,
         track = track,
@@ -574,6 +575,10 @@ fun WavySlider(
  * @param modifier the [Modifier] to be applied to this WavySlider.
  * @param enabled controls the enabled state of this WavySlider. When `false`, this component will not
  *   respond to user input, and it will appear visually disabled and disabled to accessibility services.
+ * @param onValueChange callback in which value should be updated.
+ * @param onValueChangeFinished called when value change has ended. This should not be used to
+ *   update the WavySlider value (use [onValueChange] instead), but rather to know when the user has
+ *   completed selecting a new value by ending a drag or a click.
  * @param colors [SliderColors] that will be used to resolve the colors used for this WavySlider in
  *   different states. See [SliderDefaults.colors].
  * @param interactionSource the [MutableInteractionSource] representing the stream of [Interaction]s
@@ -592,9 +597,9 @@ fun WavySlider(
  * @param incremental whether to gradually increase height from zero at start to [waveHeight] at thumb.
  * @param animationSpecs animation configurations used for various properties of the wave.
  * @param thumb the thumb to be displayed on the WavySlider, it is placed on top of the track. The lambda
- *   receives a [SliderPositions] which is used to obtain the current active track.
+ *   receives a [SliderState] which is used to obtain the current active track.
  * @param track the track to be displayed on the WavySlider, it is placed underneath the thumb. The lambda
- *   receives a [SliderPositions] which is used to obtain the current active track.
+ *   receives a [SliderState] which is used to obtain the current active track.
  */
 @Composable
 @ExperimentalMaterial3Api
@@ -602,6 +607,8 @@ fun WavySlider(
     state: SliderState,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
+    onValueChange: ((Float) -> Unit)? = null,
+    onValueChangeFinished: (() -> Unit)? = null,
     colors: SliderColors = SliderDefaults.colors(),
     interactionSource: MutableInteractionSource = remember { MutableInteractionSource() },
     /////////////////
@@ -645,6 +652,8 @@ fun WavySlider(
     WavySliderImpl(
         state = state,
         enabled = enabled,
+        onValueChange = onValueChange,
+        onValueChangeFinished = onValueChangeFinished,
         modifier = modifier,
         interactionSource = interactionSource,
         thumb = thumb,
@@ -654,9 +663,17 @@ fun WavySlider(
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
+// The @Suppress below is required to be able to access and use internal
+// members of SliderState such as isRtl, orientation, isDragging setter, dispatchRawDeltaInternal,
+// thumbWidth and thumbHeight which are marked internal in Material library.
+// Accessing the isDragging setter additionally requires "INVISIBLE_SETTER".
+// See https://stackoverflow.com/q/62500464/8583692
+@Suppress("INVISIBLE_REFERENCE", "INVISIBLE_MEMBER", "INVISIBLE_SETTER")
 private fun WavySliderImpl(
     state: SliderState,
     enabled: Boolean,
+    onValueChange: ((Float) -> Unit)?,
+    onValueChangeFinished: (() -> Unit)?,
     modifier: Modifier,
     interactionSource: MutableInteractionSource,
     thumb: @Composable (SliderState) -> Unit,
@@ -666,15 +683,37 @@ private fun WavySliderImpl(
     state.isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
     @Suppress("INVISIBLE_REFERENCE")
     val reverseDirection = state.isRtl
-    val press = Modifier.sliderTapModifier(state, interactionSource, enabled)
+    val press = Modifier.sliderTapModifier(
+        state = state,
+        interactionSource = interactionSource,
+        enabled = enabled,
+        onValueChange = onValueChange,
+        onValueChangeFinished = onValueChangeFinished
+    )
+    // Since the onValueChange and onValueChangeFinished callbacks are no longer stored in
+    // the SliderState, they are handled directly here (like the original Slider implementation).
+    // The suppress below is required to be able to access and use
+    // dispatchRawDeltaInternal() which is marked internal in Material library
+    val draggableState = rememberDraggableState { delta ->
+        @Suppress("INVISIBLE_REFERENCE")
+        state.dispatchRawDeltaInternal(delta, onValueChange)
+    }
     val drag = Modifier.draggable(
         orientation = @Suppress("INVISIBLE_REFERENCE") state.orientation,
         reverseDirection = reverseDirection,
         enabled = enabled,
         interactionSource = interactionSource,
-        onDragStopped = { @Suppress("INVISIBLE_REFERENCE") state.gestureEndAction.invoke() },
+        onDragStarted = {
+            @Suppress("INVISIBLE_REFERENCE", "INVISIBLE_MEMBER", "INVISIBLE_SETTER")
+            state.isDragging = true
+        },
+        onDragStopped = {
+            @Suppress("INVISIBLE_REFERENCE", "INVISIBLE_MEMBER", "INVISIBLE_SETTER")
+            state.isDragging = false
+            onValueChangeFinished?.invoke()
+        },
         startDragImmediately = state.isDragging,
-        state = state
+        state = draggableState
     )
     val thumbModifier = Modifier.layoutId(SliderComponents.THUMB).wrapContentWidth()
 
@@ -695,16 +734,22 @@ private fun WavySliderImpl(
         modifier = modifier
             .minimumInteractiveComponentSize()
             .requiredSizeIn(minWidth = ThumbWidth, minHeight = TrackHeight)
-            .sliderSemantics(state, enabled)
+            .sliderSemantics(state, enabled, onValueChange, onValueChangeFinished)
             .focusable(enabled, interactionSource)
             .slideOnKeyEvents(
                 enabled,
                 state.steps,
-                state.valueRange,
+                state.trackRange,
                 state.value,
                 reverseDirection,
-                state.onValueChange,
-                state.onValueChangeFinished
+                { updatedValue ->
+                    if (onValueChange != null) {
+                        onValueChange(updatedValue)
+                    } else {
+                        state.value = updatedValue
+                    }
+                },
+                onValueChangeFinished
             )
             .then(press)
             .then(drag)
@@ -734,22 +779,27 @@ private fun WavySliderImpl(
 
 @OptIn(ExperimentalMaterial3Api::class)
 // No need to name it wavySliderSemantics
-private fun Modifier.sliderSemantics(state: SliderState, enabled: Boolean): Modifier {
+private fun Modifier.sliderSemantics(
+    state: SliderState,
+    enabled: Boolean,
+    onValueChange: ((Float) -> Unit)?,
+    onValueChangeFinished: (() -> Unit)?
+): Modifier {
     return semantics {
         if (!enabled) disabled()
         setProgress(
             action = { targetValue ->
                 var newValue = targetValue.coerceIn(
-                    state.valueRange.start,
-                    state.valueRange.endInclusive
+                    state.trackRange.start,
+                    state.trackRange.endInclusive
                 )
                 val originalVal = newValue
                 val resolvedValue = if (state.steps > 0) {
                     var distance: Float = newValue
                     for (i in 0..state.steps + 1) {
                         val stepValue = lerp(
-                            state.valueRange.start,
-                            state.valueRange.endInclusive,
+                            state.trackRange.start,
+                            state.trackRange.endInclusive,
                             i.toFloat() / (state.steps + 1)
                         )
                         if (abs(stepValue - originalVal) <= distance) {
@@ -768,15 +818,13 @@ private fun Modifier.sliderSemantics(state: SliderState, enabled: Boolean): Modi
                     false
                 } else {
                     if (resolvedValue != state.value) {
-                        if (state.onValueChange != null) {
-                            state.onValueChange?.let {
-                                it(resolvedValue)
-                            }
+                        if (onValueChange != null) {
+                            onValueChange(resolvedValue)
                         } else {
                             state.value = resolvedValue
                         }
                     }
-                    state.onValueChangeFinished?.invoke()
+                    onValueChangeFinished?.invoke()
                     true
                 }
             }
@@ -788,31 +836,36 @@ private fun Modifier.sliderSemantics(state: SliderState, enabled: Boolean): Modi
         )
         .progressSemantics(
             state.value,
-            state.valueRange.start..state.valueRange.endInclusive,
+            state.trackRange.start..state.trackRange.endInclusive,
             state.steps
         )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Stable
 // No need to name it wavySliderTapModifier
+@Composable
 private fun Modifier.sliderTapModifier(
     state: SliderState,
     interactionSource: MutableInteractionSource,
-    enabled: Boolean
-) = if (enabled) {
-    pointerInput(state, interactionSource) {
+    enabled: Boolean,
+    onValueChange: ((Float) -> Unit)?,
+    onValueChangeFinished: (() -> Unit)?
+): Modifier {
+    if (!enabled) return this
+    val currentOnValueChange = rememberUpdatedState(onValueChange)
+    val currentOnValueChangeFinished = rememberUpdatedState(onValueChangeFinished)
+    return this.pointerInput(state, interactionSource) {
         detectTapGestures(
             onPress = { @Suppress("INVISIBLE_REFERENCE") state.onPress(it) },
             onTap = {
-                state.dispatchRawDelta(0f)
                 @Suppress("INVISIBLE_REFERENCE")
-                state.gestureEndAction.invoke()
+                state.dispatchRawDeltaInternal(0f, currentOnValueChange.value)
+                if (!state.isDragging) {
+                    currentOnValueChangeFinished.value?.invoke()
+                }
             }
         )
     }
-} else {
-    this
 }
 
 // No need to name it WavySliderComponents
